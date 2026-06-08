@@ -1,0 +1,12 @@
+Flask==3.0.0
+Flask-SocketIO==5.3.6
+numpy==1.24.3
+tensorflow==2.15.0
+tensorflow-lite-runtime==2.15.0
+opencv-python==4.8.1.78
+Pillow==10.1.0
+requests==2.31.0
+python-socketio==5.10.0
+eventlet==0.35.1
+scipy==1.11.4
+matplotlib==3.8.2

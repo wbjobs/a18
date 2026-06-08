@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>联邦学习监控面板 - Federated Learning Dashboard</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/dashboard.css') }}">
+    <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+</head>
+<body>
+    <div class="container">
+        <header class="header">
+            <div class="header-content">
+                <h1>🎯 边缘计算联邦学习监控平台</h1>
+                <div class="header-stats">
+                    <span class="status-badge online" id="connectionStatus">连接中...</span>
+                    <span class="round-badge">回合: <span id="currentRound">0</span></span>
+                    <span class="epsilon-badge">ε = 1.0</span>
+                </div>
+            </div>
+        </header>
+
+        <div class="stats-grid">
+            <div class="stat-card">
+                <div class="stat-icon clients-icon">👥</div>
+                <div class="stat-content">
+                    <div class="stat-label">总客户端数</div>
+                    <div class="stat-value" id="totalClients">0</div>
+                    <div class="stat-subtext">
+                        <span class="online-text" id="onlineClients">0 在线</span>
+                        <span class="offline-text" id="offlineClients">0 离线</span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="stat-card">
+                <div class="stat-icon offline-icon">📴</div>
+                <div class="stat-content">
+                    <div class="stat-label">离线率</div>
+                    <div class="stat-value" id="offlineRate">0%</div>
+                    <div class="progress-bar">
+                        <div class="progress-fill offline" id="offlineProgress" style="width: 0%"></div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="stat-card">
+                <div class="stat-icon latency-icon">⏱️</div>
+                <div class="stat-content">
+                    <div class="stat-label">平均更新延迟</div>
+                    <div class="stat-value" id="avgLatency">0.00s</div>
+                    <div class="stat-subtext">
+                        <span>最小: <span id="minLatency">0.00s</span></span>
+                        <span>最大: <span id="maxLatency">0.00s</span></span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="stat-card">
+                <div class="stat-icon update-icon">📤</div>
+                <div class="stat-content">
+                    <div class="stat-label">总更新次数</div>
+                    <div class="stat-value" id="totalUpdates">0</div>
+                    <div class="stat-subtext">
+                        <span>总样本: <span id="totalSamples">0</span></span>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="main-content">
+            <div class="left-panel">
+                <div class="panel-card">
+                    <h2>📊 客户端列表</h2>
+                    <div class="clients-list" id="clientsList">
+                        <div class="empty-state">
+                            <p>等待客户端连接...</p>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="panel-card">
+                    <h2>🏆 客户端贡献度排名</h2>
+                    <div class="contribution-list" id="contributionList">
+                        <div class="empty-state">
+                            <p>暂无贡献数据</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="right-panel">
+                <div class="panel-card">
+                    <h2>📈 更新延迟趋势</h2>
+                    <div class="chart-container">
+                        <canvas id="latencyChart"></canvas>
+                    </div>
+                </div>
+
+                <div class="panel-card">
+                    <h2>🎨 模型水印系统</h2>
+                    <div class="watermark-info">
+                        <div class="watermark-pattern" id="watermarkPattern">
+                            <div class="pattern-label">触发图案</div>
+                            <canvas id="patternCanvas" width="80" height="80"></canvas>
+                        </div>
+                        <div class="watermark-details">
+                            <p><strong>目标类别:</strong> <span id="targetClass">8 (ship)</span></p>
+                            <p><strong>触发成功率阈值:</strong> 80%</p>
+                            <button class="btn btn-primary" onclick="verifyWatermark()">验证水印</button>
+                            <div class="watermark-result" id="watermarkResult"></div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="panel-card">
+                    <h2>🔒 差分隐私配置</h2>
+                    <div class="dp-info">
+                        <div class="dp-item">
+                            <span class="dp-label">ε (epsilon)</span>
+                            <span class="dp-value">1.0</span>
+                        </div>
+                        <div class="dp-item">
+                            <span class="dp-label">δ (delta)</span>
+                            <span class="dp-value">1e-5</span>
+                        </div>
+                        <div class="dp-item">
+                            <span class="dp-label">噪声类型</span>
+                            <span class="dp-value">拉普拉斯噪声</span>
+                        </div>
+                        <div class="dp-item">
+                            <span class="dp-label">隐私预算</span>
+                            <span class="dp-value">中等保护</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="bottom-panel">
+            <div class="panel-card">
+                <h2>📋 最近活动日志</h2>
+                <div class="activity-log" id="activityLog">
+                    <div class="log-entry">
+                        <span class="log-time">[系统]</span>
+                        <span class="log-message">监控面板已启动，等待连接...</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="{{ url_for('static', filename='js/dashboard.js') }}"></script>
+</body>
+</html>
