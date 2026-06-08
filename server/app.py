@@ -451,6 +451,188 @@ def get_round_info():
         logger.error(f"Error getting round info: {e}")
         return jsonify({'error': str(e)}), 500
 
+@app.route('/verify', methods=['POST'])
+def verify_stolen_model():
+    try:
+        import tempfile
+        import tensorflow as tf
+        from tensorflow import keras
+        
+        data = request.get_json()
+        if not data:
+            data = {}
+        
+        threshold = float(data.get('threshold', 0.7))
+        check_weight = data.get('check_weight_watermark', True)
+        model_source = data.get('model_source', 'weights')
+        
+        suspect_model = None
+        
+        if model_source == 'file':
+            if 'model_file' not in data:
+                return jsonify({
+                    'success': False,
+                    'error': 'model_file required when model_source is "file"'
+                }), 400
+            
+            file_content = data['model_file']
+            if isinstance(file_content, str):
+                import base64
+                file_bytes = base64.b64decode(file_content)
+            else:
+                file_bytes = bytes(file_content)
+            
+            with tempfile.NamedTemporaryFile(suffix='.h5', delete=False) as f:
+                f.write(file_bytes)
+                temp_path = f.name
+            
+            try:
+                suspect_model = keras.models.load_model(temp_path)
+                os.unlink(temp_path)
+            except Exception as e:
+                os.unlink(temp_path)
+                return jsonify({
+                    'success': False,
+                    'error': f'Failed to load model: {str(e)}'
+                }), 400
+        
+        elif model_source == 'weights':
+            if 'weights' not in data:
+                return jsonify({
+                    'success': False,
+                    'error': 'weights required when model_source is "weights"'
+                }), 400
+            
+            try:
+                suspect_model = create_cifar10_model()
+                weights = [np.array(w, dtype=np.float32) for w in data['weights']]
+                set_model_weights(suspect_model, weights)
+            except Exception as e:
+                return jsonify({
+                    'success': False,
+                    'error': f'Failed to set model weights: {str(e)}'
+                }), 400
+        
+        elif model_source == 'global':
+            suspect_model = global_model
+        
+        else:
+            return jsonify({
+                'success': False,
+                'error': 'Invalid model_source. Must be "file", "weights", or "global"'
+            }), 400
+        
+        if suspect_model is None:
+            return jsonify({
+                'success': False,
+                'error': 'Failed to create suspect model'
+            }), 500
+        
+        (x_train, y_train), (x_test, y_test) = tf.keras.datasets.cifar10.load_data()
+        x_test = x_test.astype('float32') / 255.0
+        y_test = y_test.flatten()
+        
+        clean_predictions = suspect_model.predict(x_test[:500], verbose=0)
+        clean_accuracy = np.mean(np.argmax(clean_predictions, axis=1) == y_test[:500])
+        
+        result = watermarker.verify_watermark(suspect_model, x_test, threshold, check_weight)
+        
+        trigger_info = result.get('trigger_watermark', {})
+        weight_info = result.get('weight_watermark', {})
+        
+        is_stolen = result.get('is_stolen', False)
+        confidence = result.get('confidence', 0.0)
+        
+        risk_level = 'low'
+        if confidence >= 0.9:
+            risk_level = 'critical'
+        elif confidence >= 0.75:
+            risk_level = 'high'
+        elif confidence >= 0.5:
+            risk_level = 'medium'
+        
+        evidence = []
+        if trigger_info.get('is_stolen', False):
+            if trigger_info.get('avg_success_rate', 0) > 0:
+                evidence.append(f"Trigger pattern detected ({trigger_info.get('avg_success_rate', 0)*100:.1f}% success rate)")
+            elif trigger_info.get('success_rate', 0) > 0:
+                evidence.append(f"Trigger pattern detected ({trigger_info.get('success_rate', 0)*100:.1f}% success rate)")
+        
+        if weight_info.get('is_stolen', False):
+            evidence.append(f"Weight watermark detected ({weight_info.get('avg_match_rate', 0)*100:.1f}% match rate)")
+        
+        if not evidence:
+            evidence.append("No watermark evidence found")
+        
+        response = {
+            'success': True,
+            'is_stolen': bool(is_stolen),
+            'confidence': float(confidence),
+            'risk_level': risk_level,
+            'threshold': threshold,
+            'evidence': evidence,
+            'model_analysis': {
+                'clean_accuracy': float(clean_accuracy),
+                'num_params': int(suspect_model.count_params()),
+                'model_source': model_source
+            },
+            'trigger_watermark': {
+                'is_stolen': bool(trigger_info.get('is_stolen', False)),
+                'success_rate': float(trigger_info.get('avg_success_rate', trigger_info.get('success_rate', 0))),
+                'num_triggers_tested': int(trigger_info.get('num_triggers', 1)),
+                'target_class': int(trigger_info.get('target_class', watermarker.target_class))
+            },
+            'weight_watermark': {
+                'is_stolen': bool(weight_info.get('is_stolen', False)),
+                'match_rate': float(weight_info.get('avg_match_rate', weight_info.get('match_rate', 0))),
+                'layers_tested': int(weight_info.get('num_layers', 0)),
+                'bits_embedded': int(weight_info.get('total_bits', 0))
+            },
+            'verification_details': result,
+            'recommendation': _get_recommendation(is_stolen, risk_level, confidence)
+        }
+        
+        if is_stolen:
+            add_security_log(f"盗版模型检测 - /verify API: 置信度={confidence:.4f}, 风险等级={risk_level}")
+        
+        logger.info(f"/verify API result - is_stolen={is_stolen}, confidence={confidence:.4f}, risk={risk_level}")
+        
+        return jsonify(response)
+        
+    except Exception as e:
+        logger.error(f"Error in /verify API: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+def _get_recommendation(is_stolen: bool, risk_level: str, confidence: float) -> List[str]:
+    recommendations = []
+    
+    if is_stolen:
+        recommendations.append("This model shows strong evidence of being a stolen/piracy version")
+        recommendations.append("Consider taking legal action or issuing DMCA takedown notices")
+        recommendations.append("Review access logs and identify potential leak sources")
+        recommendations.append("Rotate watermark keys and re-embed new watermarks in future models")
+        
+        if risk_level == 'critical':
+            recommendations.append("HIGH PRIORITY: Immediate action required - model is likely stolen")
+        elif risk_level == 'high':
+            recommendations.append("Further investigation recommended before taking action")
+    else:
+        if confidence > 0.3:
+            recommendations.append("Some weak watermark signals detected, but not sufficient to confirm piracy")
+            recommendations.append("Continue monitoring for potential piracy attempts")
+        else:
+            recommendations.append("No significant watermark evidence found - model appears legitimate")
+    
+    recommendations.append("For high-value models, consider embedding additional watermarks")
+    recommendations.append("Regularly scan public model repositories for potential piracy")
+    
+    return recommendations
+
 @socketio.on('connect')
 def handle_connect():
     logger.info('Client connected to WebSocket')
