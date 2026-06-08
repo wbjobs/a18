@@ -76,9 +76,12 @@ def try_aggregate():
                 current_round += 1
                 logger.info(f"Starting aggregation round {current_round} with {len(client_updates_buffer)} updates")
                 
-                aggregated_weights = aggregator.aggregate(client_updates_buffer, use_dp=True)
+                aggregated_weights, agg_info = aggregator.aggregate(client_updates_buffer, use_dp=True)
                 
-                watermarked_weights = create_watermarked_weights(
+                watermarked_weights = watermarker.weight_watermark.embed_in_layers(
+                    aggregated_weights, 
+                    strength=0.02
+                ) if watermarker.enable_robust_weight else create_watermarked_weights(
                     aggregated_weights, 
                     secret_key="federated_watermark_2024",
                     strength=0.005
@@ -90,15 +93,39 @@ def try_aggregate():
                 global_model.save(model_path)
                 logger.info(f"Global model saved to {model_path}")
                 
-                contributions = aggregator.compute_contribution(client_updates_buffer)
-                for client_id, contrib in contributions.items():
-                    monitor.update_contribution(client_id, contrib)
+                filtered_updates = client_updates_buffer
+                if agg_info.get('filter_info', {}).get('filtered'):
+                    filter_info = agg_info['filter_info']
+                    removed_ids = filter_info.get('removed', []) + filter_info.get('downweighted', [])
+                    filtered_updates = [u for u in client_updates_buffer if u['client_id'] not in removed_ids]
+                    logger.info(f"Using {len(filtered_updates)} filtered clients for contribution calculation")
+                
+                if filtered_updates:
+                    contributions = aggregator.compute_contribution(filtered_updates)
+                    for client_id, contrib in contributions.items():
+                        monitor.update_contribution(client_id, contrib)
+                else:
+                    contributions = aggregator.compute_contribution(client_updates_buffer)
+                    for client_id, contrib in contributions.items():
+                        monitor.update_contribution(client_id, contrib)
                 
                 socketio.emit('aggregation_complete', {
                     'round': current_round,
                     'num_clients': len(client_updates_buffer),
-                    'contributions': contributions
+                    'filtered_clients': len(filtered_updates),
+                    'contributions': contributions,
+                    'agg_info': agg_info,
+                    'robust_method': agg_info.get('robust_method', 'fedavg'),
+                    'epsilon': agg_info.get('epsilon', 1.0)
                 })
+                
+                if agg_info.get('filter_info', {}).get('filtered'):
+                    socketio.emit('security_alert', {
+                        'type': 'malicious_update_detected',
+                        'round': current_round,
+                        'info': agg_info['filter_info']
+                    })
+                    add_security_log(f"检测到恶意更新: {agg_info['filter_info']}")
                 
                 logger.info(f"Round {current_round} completed successfully")
                 
@@ -107,6 +134,14 @@ def try_aggregate():
             except Exception as e:
                 logger.error(f"Aggregation failed: {e}")
                 socketio.emit('error', {'message': f'Aggregation failed: {str(e)}'})
+
+security_logs = []
+def add_security_log(message: str):
+    timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
+    security_logs.append({'timestamp': timestamp, 'message': message})
+    if len(security_logs) > 100:
+        security_logs.pop(0)
+    socketio.emit('security_log', {'timestamp': timestamp, 'message': message})
 
 def cleanup_old_updates():
     global client_updates_buffer
@@ -182,8 +217,27 @@ def receive_client_update():
         latency = data.get('latency', 0)
         client_round = data.get('round', 0)
         
+        is_duplicate, update_hash = aggregator.check_duplicate(client_id, client_round, [np.array(w) for w in weights])
+        if is_duplicate:
+            logger.warning(f"Rejected duplicate update from {client_id} (round {client_round})")
+            add_security_log(f"拒绝重复更新: {client_id} 回合 {client_round}")
+            return jsonify({
+                'success': False,
+                'error': 'Duplicate update detected',
+                'error_code': 'DUPLICATE_UPDATE',
+                'server_round': current_round
+            }), 409
+        
+        weights_np = [np.array(w) for w in weights]
+        update_norm = np.sqrt(sum(np.linalg.norm(w)**2 for w in weights_np))
+        if update_norm > 1000:
+            logger.warning(f"Suspicious large norm update from {client_id}: {update_norm:.2f}")
+            add_security_log(f"检测到异常大梯度: {client_id} 范数={update_norm:.2f}")
+        
         monitor.register_client(client_id, data.get('metadata', {}))
         monitor.record_update(client_id, num_samples, latency, client_round)
+        
+        aggregator.mark_update_processed(client_id, client_round, update_hash)
         
         with lock:
             client_updates_buffer.append({
@@ -192,10 +246,11 @@ def receive_client_update():
                 'num_samples': num_samples,
                 'metrics': metrics,
                 'timestamp': time.time(),
-                'round': client_round
+                'round': client_round,
+                'update_hash': update_hash
             })
         
-        logger.info(f"Received update from {client_id}: {num_samples} samples, round {client_round}")
+        logger.info(f"Received update from {client_id}: {num_samples} samples, round {client_round}, norm={update_norm:.2f}")
         
         threading.Thread(target=try_aggregate, daemon=True).start()
         
@@ -203,7 +258,8 @@ def receive_client_update():
             'success': True,
             'message': 'Update received',
             'server_round': current_round,
-            'pending_updates': len(client_updates_buffer)
+            'pending_updates': len(client_updates_buffer),
+            'update_hash': update_hash
         })
         
     except Exception as e:
@@ -295,13 +351,17 @@ def get_contributions():
 def verify_watermark():
     try:
         data = request.get_json()
-        threshold = data.get('threshold', 0.8)
+        threshold = data.get('threshold', 0.7)
+        check_weight = data.get('check_weight_watermark', True)
         
         import tensorflow as tf
         (x_train, y_train), (x_test, y_test) = tf.keras.datasets.cifar10.load_data()
         x_test = x_test.astype('float32') / 255.0
         
-        result = watermarker.verify_watermark(global_model, x_test, threshold)
+        result = watermarker.verify_watermark(global_model, x_test, threshold, check_weight)
+        
+        if result.get('is_stolen'):
+            add_security_log(f"水印验证检测到盗版模型 (置信度: {result.get('confidence', 0):.4f})")
         
         return jsonify(result)
         
@@ -312,15 +372,69 @@ def verify_watermark():
 @app.route('/api/watermark/pattern', methods=['GET'])
 def get_watermark_pattern():
     try:
-        pattern = watermarker.get_trigger_pattern_image()
-        return jsonify({
-            'success': True,
-            'pattern': pattern.tolist(),
-            'shape': pattern.shape,
-            'target_class': watermarker.target_class
-        })
+        if watermarker.enable_multi_trigger:
+            triggers = []
+            for trigger in watermarker.multi_trigger.triggers:
+                triggers.append({
+                    'id': trigger['id'],
+                    'pattern': trigger['pattern'].tolist(),
+                    'shape': trigger['pattern'].shape,
+                    'target_class': trigger['target_class'],
+                    'position': trigger['position'],
+                    'size': trigger['size']
+                })
+            return jsonify({
+                'success': True,
+                'multi_trigger': True,
+                'triggers': triggers,
+                'num_triggers': len(triggers)
+            })
+        else:
+            pattern = watermarker.get_trigger_pattern_image()
+            return jsonify({
+                'success': True,
+                'multi_trigger': False,
+                'pattern': pattern.tolist(),
+                'shape': pattern.shape,
+                'target_class': watermarker.target_class
+            })
     except Exception as e:
         logger.error(f"Error getting watermark pattern: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/security/logs', methods=['GET'])
+def get_security_logs():
+    try:
+        return jsonify({
+            'success': True,
+            'logs': security_logs[-50:]
+        })
+    except Exception as e:
+        logger.error(f"Error getting security logs: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/security/alerts', methods=['GET'])
+def get_security_alerts():
+    try:
+        alerts = []
+        if hasattr(aggregator, 'anomaly_detector') and aggregator.anomaly_detector:
+            suspicion_scores = aggregator.anomaly_detector.client_suspicion_scores
+            for client_id, score in suspicion_scores.items():
+                if score >= 2.0:
+                    alerts.append({
+                        'type': 'suspicious_client',
+                        'client_id': client_id,
+                        'suspicion_score': score,
+                        'severity': 'high' if score >= 5.0 else 'medium'
+                    })
+        
+        return jsonify({
+            'success': True,
+            'alerts': alerts,
+            'suspicion_scores': dict(suspicion_scores) if 'suspicion_scores' in locals() else {}
+        })
+    except Exception as e:
+        logger.error(f"Error getting security alerts: {e}")
         return jsonify({'success': False, 'error': str(e)}), 500
 
 @app.route('/api/round/info', methods=['GET'])
